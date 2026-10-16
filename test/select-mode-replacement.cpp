@@ -99,34 +99,13 @@ int main() {
         return 1;
     if (!send(engine, entry, *context, FcitxKey_Left, true))
         return 1;
-    const std::vector<std::string> afterFirst{"á"};
-    if (context->commits() != afterFirst) {
-        reportFailure("verify commit after the last left arrow", "commits=['á']", commitList(*context) + ", selects=" + std::to_string(selects),
-                      "the replacement was not committed exactly once when the selection completed");
-        return 1;
-    }
 
-    // The buffered x is replayed after the commit and starts a second selection.
-    // No left arrow is replayed: only one new request arrives and it matches the
-    // count the replacement needs.
-    size_t replaySelects = 0;
-    if (!receiveSelectRequest(listener, replaySelects, "buffered key was not replayed after the selection completed",
-                              "buffered x replay starts another selection request within 5000 ms"))
-        return 1;
-    for (size_t i = 0; i < replaySelects - 1; ++i) {
-        if (!send(engine, entry, *context, FcitxKey_Left, false))
-            return 1;
-    }
-    if (!send(engine, entry, *context, FcitxKey_Delete, false))
-        return 1;
-    if (!send(engine, entry, *context, FcitxKey_Left, true))
-        return 1;
-
-    const std::vector<std::string> expected{"á", "ã"};
+    // x typed while the selection is in flight is folded into the same commit,
+    // so the selected "a" is replaced by ã and no second selection is started.
+    const std::vector<std::string> expected{"ã"};
     if (context->commits() != expected) {
-        reportFailure("verify final replay commits", "commits=['á']['ã']",
-                      commitList(*context) + ", first-selects=" + std::to_string(selects) + ", replay-selects=" + std::to_string(replaySelects),
-                      "the buffered key replay did not produce the expected final commits, or a left arrow was replayed");
+        reportFailure("verify folded select commit", "commits=['ã']", commitList(*context) + ", selects=" + std::to_string(selects),
+                      "x typed during the selection must fold into one commit of ã");
         return 1;
     }
     return 0;

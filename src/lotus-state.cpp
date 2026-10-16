@@ -24,7 +24,10 @@
 #include <fcitx/userinterface.h>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -36,6 +39,23 @@ namespace fcitx {
 
     int           clampDelay(int value) {
         return std::clamp(value, kMinDelayMs, kMaxDelayMs);
+    }
+
+    // Narrow no-break space. Committing it replaces the address-bar selection, so the
+    // following Backspace deletes this pad instead of only dismissing inline completion.
+    bool browserEatsInlineBackspace(std::string_view program) {
+        std::string lower;
+        lower.reserve(program.size());
+        for (unsigned char ch : program)
+            lower.push_back(static_cast<char>(std::tolower(ch)));
+        // gnome-shell is the single ibus context GNOME Wayland uses for every
+        // client, so Chrome's address bar arrives under that name.
+        static constexpr std::array<std::string_view, 8> browsers = {"chrome", "chromium", "brave", "firefox", "msedge", "vivaldi", "opera", "gnome-shell"};
+        for (const auto name : browsers) {
+            if (lower.find(name) != std::string::npos)
+                return true;
+        }
+        return false;
     }
 
     bool isWordBreak(uint32_t ucs4) {
@@ -162,10 +182,23 @@ namespace fcitx {
             unsigned int selectionStart = std::min(anchor, cursor);
             unsigned int selectionEnd   = std::max(anchor, cursor);
 
+            // Chromium's text-input-v3 client reports the caret as selection.end()
+            // and the anchor as selection.start(). Inline completion is a range
+            // from the typed text to the end of the suggestion, so the caret lands
+            // at the end of the line and the typed word sits just before the
+            // selection. The first Backspace only clears that selection.
+            const bool caretAtEndOfSuggestion = selectionEnd == cursor && cursor == static_cast<unsigned int>(textLen) && selectionStart < cursor;
+            bool       typedWordBeforeSuggestion = false;
+            if (caretAtEndOfSuggestion && selectionStart <= u32Text.size() && u32Text.size() >= oldPreBuffer_.size()) {
+                const size_t head = static_cast<size_t>(selectionStart);
+                if (head >= oldPreBuffer_.size())
+                    typedWordBeforeSuggestion = u32Text.compare(head - oldPreBuffer_.size(), oldPreBuffer_.size(), oldPreBuffer_) == 0;
+            }
+
             // Only consider it browser autofill if the selection starts at the cursor
             // and extends to the end of the line (common address bar behavior).
-            if (selectionStart >= cursor || (selectionStart < cursor && selectionEnd > cursor)) {
-                if (!sameprefix)
+            if (selectionStart >= cursor || (selectionStart < cursor && selectionEnd > cursor) || typedWordBeforeSuggestion) {
+                if (!typedWordBeforeSuggestion && !sameprefix)
                     return false;
                 // If the selection contains a newline, it's likely a multiline editor (AI ghost text),
                 // not a single-line URL/Search bar.
@@ -424,7 +457,48 @@ namespace fcitx {
         ic_.updateUserInterface(UserInterfaceComponent::InputPanel);
     }
 
+    void LotusState::foldBufferedKeysIntoPendingCommit() {
+        // Minecraft swallows a real backspace, so the prefix left on screen is not the one this fold assumes.
+        if (buffered_keys_.empty() || realMode == LotusMode::Minecraft || !lotusEngine_ || *engine_.config().outputCharset != Charset::Unicode)
+            return;
+        if (pending_commit_string_.size() > oldPreBuffer_.size())
+            return;
+        const size_t prefixLen = oldPreBuffer_.size() - pending_commit_string_.size();
+        if (oldPreBuffer_.compare(prefixLen, std::u32string::npos, pending_commit_string_) != 0)
+            return;
+
+        const std::u32string prefix       = oldPreBuffer_.substr(0, prefixLen);
+        const std::u32string savedPreedit = oldPreBuffer_;
+        bool                 mutated      = false;
+        for (const auto& key : buffered_keys_) {
+            const auto     sym = static_cast<KeySym>(key.sym);
+            const uint32_t cp  = Key::keySymToUnicode(sym);
+            if (cp == 0U) {
+                if (mutated)
+                    lotusEngine_->rebuildFromText(savedPreedit);
+                return;
+            }
+            const bool           processed = lotusEngine_->processKey(engineKeyValue(sym), lotus::keyStatesFromBits(key.state));
+            const std::u32string commitStr = pullCommitString();
+            const std::u32string preedit   = pullPreeditString();
+            mutated                         = true;
+            if (!processed || !commitStr.empty() || preedit.compare(0, prefix.size(), prefix) != 0) {
+                lotusEngine_->rebuildFromText(savedPreedit);
+                return;
+            }
+        }
+
+        const std::u32string finalPreedit = pullPreeditString();
+        pending_commit_string_            = finalPreedit.substr(prefixLen);
+        oldPreBuffer_                     = finalPreedit;
+        hasHistory_                       = !finalPreedit.empty();
+        realtextLen.fetch_add(static_cast<unsigned int>(buffered_keys_.size()), std::memory_order_acq_rel);
+        buffered_keys_.clear();
+        LOTUS_INFO("Folded fast keys into replacement: " + lotus::utf8::encode(finalPreedit));
+    }
+
     void LotusState::finishReplacement(KeyEvent& event) {
+        foldBufferedKeysIntoPendingCommit();
         std::u32string commitText = std::move(pending_commit_string_);
         pending_commit_string_.clear();
 
@@ -473,6 +547,16 @@ namespace fcitx {
         expected_backspaces_           = diffPart.deletedPart.size();
         const auto& surrounding        = ic_.surroundingText();
         bool        isAutofillCertain_ = isAutofillCertain(surrounding);
+        // The address bar eats the first Backspace to clear inline completion, so
+        // "oo" stays "oô" unless one extra real backspace deletes the typed letter.
+        // A placeholder would be the character that extra key removes, and the
+        // original letter would remain. GNOME Wayland names every client
+        // gnome-shell, and the app rule for that name selects SuperSmooth, which
+        // otherwise skips this compensation. A longer plain field still has valid
+        // surrounding text and keeps a single real backspace.
+        const bool eatsCompletionBackspace =
+            browserEatsInlineBackspace(ic_.program()) && (realMode == LotusMode::Smooth || realMode == LotusMode::SuperSmooth);
+        const bool addressBarWithoutText = eatsCompletionBackspace && !isAutofillCertain_ && !surrounding.isValid();
         if (realMode != LotusMode::Minecraft) {
             ++expected_backspaces_;
             // Enable Autofill detection for all frontends (Wayland/IBus).
@@ -482,8 +566,10 @@ namespace fcitx {
             // Skipped for Select: the app only sees expected_backspaces_ - 1
             // arrows, and the autofill suffix is already selected, so the one
             // arrow reaches the character being replaced and the commit swaps
-            // both at once.
-            if (realMode != LotusMode::SuperSmooth && isAutofillCertain_) {
+            // both at once. SuperSmooth keeps the skip except for the address
+            // bar, where the first Backspace is consumed by inline completion.
+            const bool compensateAutofill = isAutofillCertain_ && (realMode != LotusMode::SuperSmooth || eatsCompletionBackspace);
+            if (compensateAutofill || addressBarWithoutText) {
                 ++expected_backspaces_;
             }
         }
