@@ -513,9 +513,16 @@ namespace fcitx {
         const bool uinputMode         = isUinputMode(targetMode);
         const bool focusBounce        = uinputMode && state->lastDeactivateTime_ > 0 && now_ms() - state->lastDeactivateTime_ < 100;
         const bool resumeReplacement  = focusBounce && state->deletionInterruptedAt_ > 0 && is_deleting_.load();
+        const bool signalLost         = state->missingOnlySignalBackspace();
         state->deletionInterruptedAt_ = 0;
 
-        if (!resumeReplacement) {
+        // The real backspaces have already reached the app. The remaining echo is the
+        // one fcitx swallows, and a focus bounce (Chrome resetting the text input on
+        // Backspace) drops it. Commit now, or the field stays empty and every later
+        // key is swallowed while is_deleting_ stays true.
+        if (signalLost) {
+            state->commitInterruptedReplacement();
+        } else if (!resumeReplacement) {
             is_deleting_.store(false);
         }
 
@@ -531,7 +538,7 @@ namespace fcitx {
         } else if (surrvalid && !state->oldPreBuffer_.empty() && (now_ms() - state->lastDeactivateTime_) >= 100) {
             state->clearAllBuffers();
         }
-        if (!resumeReplacement) {
+        if (!resumeReplacement && !signalLost) {
             is_deleting_.store(false);
         }
         if (targetMode == LotusMode::Emoji) {

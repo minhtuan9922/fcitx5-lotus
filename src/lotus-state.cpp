@@ -497,6 +497,23 @@ namespace fcitx {
         LOTUS_INFO("Folded fast keys into replacement: " + lotus::utf8::encode(finalPreedit));
     }
 
+    bool LotusState::missingOnlySignalBackspace() const {
+        return realMode != LotusMode::Minecraft && is_deleting_.load(std::memory_order_acquire) && expected_backspaces_ > 0 &&
+               current_backspace_count_ + 1 >= expected_backspaces_;
+    }
+
+    void LotusState::commitInterruptedReplacement() {
+        foldBufferedKeysIntoPendingCommit();
+        std::u32string commitText = std::move(pending_commit_string_);
+        pending_commit_string_.clear();
+        lotus::fcitx_text::commit(&ic_, commitText, last_commit_time_);
+        expected_backspaces_     = 0;
+        current_backspace_count_ = 0;
+        is_deleting_.store(false, std::memory_order_release);
+        LOTUS_INFO("Commit replacement after a lost signal backspace: " + lotus::utf8::encode(commitText));
+        replayBufferedKeys();
+    }
+
     void LotusState::finishReplacement(KeyEvent& event) {
         foldBufferedKeysIntoPendingCommit();
         std::u32string commitText = std::move(pending_commit_string_);
