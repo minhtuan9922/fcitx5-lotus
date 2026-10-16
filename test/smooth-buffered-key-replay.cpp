@@ -61,17 +61,17 @@ int main() {
     engine.activate(entry, focus);
     context->resetPreeditUpdateCount();
 
-    // Telex a, s changes the real Bamboo preedit a -> á. Smooth mode replaces
-    // the old character through the kbSocket transport.
-    if (!send(engine, entry, *context, FcitxKey_a, false) || !send(engine, entry, *context, FcitxKey_s, true))
+    // Telex rooif -> rồi. The second o starts a replacement; i and f arrive
+    // before it finishes and must be folded into that commit. A second backspace
+    // round deletes the word down to "r" when the intermediate commit has not landed.
+    if (!send(engine, entry, *context, FcitxKey_r, false) || !send(engine, entry, *context, FcitxKey_o, false) || !send(engine, entry, *context, FcitxKey_o, true))
         return 1;
     size_t backspaces = 0;
-    if (!receiveBackspaceRequest(listener, backspaces, "the initial Telex replacement request did not arrive"))
+    if (!receiveBackspaceRequest(listener, backspaces, "the oo replacement request did not arrive"))
         return 1;
-
-    if (!send(engine, entry, *context, FcitxKey_x, true) || !context->commits().empty()) {
-        reportFailure("buffer key x before deletion completes", "no immediate commits", "commits=" + std::to_string(context->commits().size()),
-                      "buffered key x was emitted before the first replacement completed");
+    if (!send(engine, entry, *context, FcitxKey_i, true) || !send(engine, entry, *context, FcitxKey_f, true) || !context->commits().empty()) {
+        reportFailure("buffer i and f before deletion completes", "no immediate commits", "commits=" + std::to_string(context->commits().size()),
+                      "keys typed during the oo replacement were emitted before it completed");
         return 1;
     }
     for (size_t i = 0; i < backspaces; ++i) {
@@ -80,27 +80,191 @@ int main() {
     }
     if (!send(engine, entry, *context, FcitxKey_Pause, true))
         return 1;
-
-    size_t replayBackspaces = 0;
-    if (!receiveBackspaceRequest(listener, replayBackspaces, "buffered key was not replayed after deletion", "buffered x replay starts another replacement request within 5000 ms"))
+    const std::vector<std::string> roi{"ồi"};
+    if (context->commits() != roi) {
+        std::string actual = "commits=";
+        for (const auto& commit : context->commits())
+            actual += "['" + commit + "']";
+        reportFailure("verify rooif folded commit", "commits=['ồi']", actual + ", backspaces=" + std::to_string(backspaces),
+                      "fast Telex rooif must commit ồi once, after the oo backspaces and the anchor Pause, so the word is rồi");
         return 1;
-    for (size_t i = 0; i < replayBackspaces; ++i) {
+    }
+
+    // Telex a, s changes a -> á. x typed during that replacement folds into ã.
+    if (!send(engine, entry, *context, FcitxKey_Escape, false) || !send(engine, entry, *context, FcitxKey_a, false) || !send(engine, entry, *context, FcitxKey_s, true))
+        return 1;
+    size_t toneBackspaces = 0;
+    if (!receiveBackspaceRequest(listener, toneBackspaces, "the a/s replacement request did not arrive"))
+        return 1;
+    if (!send(engine, entry, *context, FcitxKey_x, true))
+        return 1;
+    for (size_t i = 0; i < toneBackspaces; ++i) {
+        if (!send(engine, entry, *context, FcitxKey_BackSpace, false))
+            return 1;
+    }
+    if (!send(engine, entry, *context, FcitxKey_Pause, true))
+        return 1;
+    const std::vector<std::string> expected{"ồi", "ã"};
+    if (context->commits() != expected) {
+        std::string actual = "commits=";
+        for (const auto& commit : context->commits())
+            actual += "['" + commit + "']";
+        reportFailure("verify folded tone commit", "commits=['ồi']['ã']", actual, "x typed during a -> á must fold into a single commit of ã");
+        return 1;
+    }
+
+    // Chromium reports inline completion with the caret at the end of the
+    // suggestion (cursor) and the anchor where the typed word ends. "go" then
+    // the second o must delete the typed o and the selected tail.
+    auto expectGoogleBackspaces = [&](const char* label, const std::string& text, unsigned int cursor, unsigned int anchor, size_t expectedCount) {
+        fcitx::KeyEvent escapeEvent(context.get(), fcitx::Key(FcitxKey_Escape), false);
+        engine.keyEvent(entry, escapeEvent);
+        if (escapeEvent.accepted()) {
+            reportFailure(label, "Escape resets composition", "Escape was accepted", "a finished replacement must not still be swallowing keys");
+            return false;
+        }
+        if (!send(engine, entry, *context, FcitxKey_g, false) || !send(engine, entry, *context, FcitxKey_o, false))
+            return false;
+        context->setCapabilityFlags(fcitx::CapabilityFlag::SurroundingText);
+        context->surroundingText().setText(text, cursor, anchor);
+        context->updateSurroundingText();
+        if (!send(engine, entry, *context, FcitxKey_o, true))
+            return false;
+        size_t count = 0;
+        if (!receiveBackspaceRequest(listener, count, label))
+            return false;
+        if (count != expectedCount) {
+            reportFailure(label, "backspaces=" + std::to_string(expectedCount), "backspaces=" + std::to_string(count),
+                          "the address bar eats the first Backspace to clear inline completion; a plain field must keep the normal count");
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (!send(engine, entry, *context, FcitxKey_BackSpace, false))
+                return false;
+        }
+        if (!send(engine, entry, *context, FcitxKey_Pause, true))
+            return false;
+        return true;
+    };
+    if (!expectGoogleBackspaces("caret at end of suggestion", "google.com", 10, 2, 2))
+        return 1;
+    if (!expectGoogleBackspaces("caret at start of suggestion", "google.com", 2, 10, 2))
+        return 1;
+    if (!expectGoogleBackspaces("plain field with no suggestion", "go", 2, 2, 1))
+        return 1;
+
+    // Stale selection from an older prefix must not add a backspace: the
+    // typed word is no longer the text in front of that selection.
+    if (!send(engine, entry, *context, FcitxKey_Escape, false) || !send(engine, entry, *context, FcitxKey_c, false) || !send(engine, entry, *context, FcitxKey_h, false) ||
+        !send(engine, entry, *context, FcitxKey_u, false))
+        return 1;
+    context->surroundingText().setText("chrome://gpu", 2, 12);
+    context->updateSurroundingText();
+    if (!send(engine, entry, *context, FcitxKey_s, true))
+        return 1;
+    size_t staleCount = 0;
+    if (!receiveBackspaceRequest(listener, staleCount, "stale suggestion must not add a backspace"))
+        return 1;
+    if (staleCount != 1) {
+        reportFailure("stale suggestion", "backspaces=1", "backspaces=" + std::to_string(staleCount),
+                      "a selection that no longer matches the typed word must not delete the character before the mark");
+        return 1;
+    }
+    for (size_t i = 0; i < staleCount; ++i) {
         if (!send(engine, entry, *context, FcitxKey_BackSpace, false))
             return 1;
     }
     if (!send(engine, entry, *context, FcitxKey_Pause, true))
         return 1;
 
-    const std::vector<std::string> expected{"á", "ã"};
-    if (context->commits() != expected) {
-        std::string actual = "commits=";
-        for (const auto& commit : context->commits())
-            actual += "['" + commit + "']";
-        const auto meaning = "the buffered key replay did not produce the expected final commits; "
-                             "first-backspaces=" +
-            std::to_string(backspaces) + ", replay-backspaces=" + std::to_string(replayBackspaces);
-        reportFailure("verify final replay commits", "commits=['á']['ã']", actual, meaning);
+    // Chrome and GNOME Wayland often send no surrounding text for the address
+    // bar. "oo" then needs one extra real backspace so the eaten key does not
+    // leave the first o in front of ô.
+    auto expectAddressBarOo = [&](const char* label, TestInputContext& addressContext) {
+        if (!send(engine, entry, addressContext, FcitxKey_o, false) || !send(engine, entry, addressContext, FcitxKey_o, true))
+            return false;
+        if (!addressContext.commits().empty()) {
+            std::string actual = "commits=";
+            for (const auto& commit : addressContext.commits())
+                actual += "['" + commit + "']";
+            reportFailure(label, "no commit yet", actual, "the address bar must not commit a placeholder before the backspaces");
+            return false;
+        }
+        size_t addressBackspaces = 0;
+        if (!receiveBackspaceRequest(listener, addressBackspaces, label))
+            return false;
+        if (addressBackspaces != 2) {
+            reportFailure(label, "backspaces=2", "backspaces=" + std::to_string(addressBackspaces),
+                          "one real backspace clears inline completion and another deletes the typed o");
+            return false;
+        }
+        for (size_t i = 0; i < addressBackspaces; ++i) {
+            if (!send(engine, entry, addressContext, FcitxKey_BackSpace, false))
+                return false;
+        }
+        if (!send(engine, entry, addressContext, FcitxKey_Pause, true))
+            return false;
+        const std::vector<std::string> addressExpected{"ô"};
+        if (addressContext.commits() != addressExpected) {
+            std::string actual = "commits=";
+            for (const auto& commit : addressContext.commits())
+                actual += "['" + commit + "']";
+            reportFailure(label, "commits=['ô']", actual, "oo in the address bar must end as ô");
+            return false;
+        }
+        return true;
+    };
+    auto chromeContext = std::make_unique<TestInputContext>(&testInstance.instance, "chrome");
+    chromeContext->focusIn();
+    fcitx::InputContextEvent chromeFocus(chromeContext.get(), fcitx::EventType::InputContextFocusIn);
+    engine.activate(entry, chromeFocus);
+    if (!expectAddressBarOo("Chrome oo without surrounding text", *chromeContext))
+        return 1;
+
+    // A Chrome field that already contains text before the word is not the address bar.
+    if (!send(engine, entry, *chromeContext, FcitxKey_Escape, false) || !send(engine, entry, *chromeContext, FcitxKey_t, false) ||
+        !send(engine, entry, *chromeContext, FcitxKey_o, false))
+        return 1;
+    chromeContext->setCapabilityFlags(fcitx::CapabilityFlag::SurroundingText);
+    chromeContext->surroundingText().setText("hello to", 8, 8);
+    chromeContext->updateSurroundingText();
+    const auto commitsBefore = chromeContext->commits().size();
+    if (!send(engine, entry, *chromeContext, FcitxKey_o, true))
+        return 1;
+    if (chromeContext->commits().size() != commitsBefore) {
+        reportFailure("plain Chrome field", "no extra commit", "commits grew", "a longer plain field must keep a single real backspace");
         return 1;
     }
+    size_t plainBackspaces = 0;
+    if (!receiveBackspaceRequest(listener, plainBackspaces, "the plain Chrome field replacement did not arrive"))
+        return 1;
+    if (plainBackspaces != 1) {
+        reportFailure("plain Chrome field backspaces", "backspaces=1", "backspaces=" + std::to_string(plainBackspaces),
+                      "a longer plain field keeps a single real backspace");
+        return 1;
+    }
+    for (size_t i = 0; i < plainBackspaces; ++i) {
+        if (!send(engine, entry, *chromeContext, FcitxKey_BackSpace, false))
+            return 1;
+    }
+    if (!send(engine, entry, *chromeContext, FcitxKey_Pause, true))
+        return 1;
+
+    // GNOME Wayland creates one ibus context named gnome-shell and the app rule
+    // forces SuperSmooth, which used to skip the extra backspace entirely.
+    fcitx::RawConfig superConfig;
+    superConfig.setValueByPath("Mode", "Uinput (Super Smooth)");
+    superConfig.setValueByPath("InputMethod", "Telex");
+    engine.setConfig(superConfig);
+    if (engine.config().mode.value() != fcitx::LotusMode::SuperSmooth) {
+        reportFailure("switch to SuperSmooth", "mode=SuperSmooth", "mode stayed Smooth", "the gnome-shell address bar runs in SuperSmooth");
+        return 1;
+    }
+    auto shellContext = std::make_unique<TestInputContext>(&testInstance.instance, "gnome-shell");
+    shellContext->focusIn();
+    fcitx::InputContextEvent shellFocus(shellContext.get(), fcitx::EventType::InputContextFocusIn);
+    engine.activate(entry, shellFocus);
+    if (!expectAddressBarOo("gnome-shell SuperSmooth oo", *shellContext))
+        return 1;
     return 0;
 }

@@ -85,11 +85,6 @@ int main() {
         return 1;
     }
 
-    if (!send(engine, entry, *context, FcitxKey_x, true) || !context->commits().empty()) {
-        reportFailure("buffer key x before deletion completes", "no immediate commits", "commits=" + std::to_string(context->commits().size()),
-                      "buffered key x was emitted before the first replacement completed");
-        return 1;
-    }
     for (size_t i = 0; i < first.count; ++i) {
         if (!send(engine, entry, *context, FcitxKey_BackSpace, false))
             return 1;
@@ -97,8 +92,13 @@ int main() {
     if (!send(engine, entry, *context, FcitxKey_Pause, true))
         return 1;
 
+    // x after the commit of á starts a new replacement. Keys typed *during*
+    // the first replacement are folded into that commit and do not send another request.
+    if (!send(engine, entry, *context, FcitxKey_x, true))
+        return 1;
     KbMsg second{};
-    if (!receiveBackspaceRequest(listener, second, "buffered key was not replayed after deletion", "buffered x replay starts another replacement request within 5000 ms"))
+    if (!receiveBackspaceRequest(listener, second, "the tone change after a commit did not request a replacement",
+                                 "x after á starts another replacement request within 5000 ms"))
         return 1;
     if (second.preDelay < 900 || second.preDelay > 1000) {
         reportFailure("commit cooldown on the repeated request", "preDelay in [900, 1000]", "preDelay=" + std::to_string(second.preDelay),

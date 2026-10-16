@@ -284,13 +284,23 @@ namespace fcitx {
         /**
          * @brief Completes an in-flight replacement after all echoed events arrived.
          *
-         * Shared tail of the BackSpace and Shift+Left echo handlers: waits for the
-         * app to settle, commits the pending replacement string, resets the
-         * replacement state, swallows the final echo and replays buffered keys.
+         * Shared tail of the BackSpace and Shift+Left echo handlers: folds keys typed
+         * during the replacement into one commit when they still share the
+         * on-screen prefix, then resets the replacement state, swallows the final
+         * echo and replays whatever could not be folded.
          *
          * @param event The key event of the final echoed key.
          */
         void finishReplacement(KeyEvent& event);
+
+        /**
+         * @brief Folds keys buffered during a replacement into the pending commit.
+         *
+         * A second backspace round for those keys races the commit that just landed
+         * and can delete the word down to its first letter. Keys whose result still
+         * begins with the prefix left on screen are applied here instead.
+         */
+        void foldBufferedKeysIntoPendingCommit();
 
         /**
          * @brief Performs text replacement via uinput.
