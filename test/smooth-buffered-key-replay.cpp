@@ -266,5 +266,45 @@ int main() {
     engine.activate(entry, shellFocus);
     if (!expectAddressBarOo("gnome-shell SuperSmooth oo", *shellContext))
         return 1;
+
+    // Gemini's chat box drops focus when the real Backspace lands. The anchor
+    // Pause never returns. "ex" must still commit ẽ, and the next letter must
+    // not be swallowed.
+    auto geminiContext = std::make_unique<TestInputContext>(&testInstance.instance, "gnome-shell");
+    geminiContext->focusIn();
+    fcitx::InputContextEvent geminiFocus(geminiContext.get(), fcitx::EventType::InputContextFocusIn);
+    engine.activate(entry, geminiFocus);
+    if (!send(engine, entry, *geminiContext, FcitxKey_e, false))
+        return 1;
+    geminiContext->setCapabilityFlags(fcitx::CapabilityFlag::SurroundingText);
+    geminiContext->surroundingText().setText("e", 1, 1);
+    geminiContext->updateSurroundingText();
+    if (!send(engine, entry, *geminiContext, FcitxKey_x, true))
+        return 1;
+    size_t toneCount = 0;
+    if (!receiveBackspaceRequest(listener, toneCount, "the ex replacement request did not arrive"))
+        return 1;
+    if (toneCount != 1) {
+        reportFailure("ex backspaces", "backspaces=1", "backspaces=" + std::to_string(toneCount), "e to ẽ in a normal field deletes one character; Pause is the anchor");
+        return 1;
+    }
+    if (!send(engine, entry, *geminiContext, FcitxKey_BackSpace, false))
+        return 1;
+    geminiContext->focusOut();
+    fcitx::InputContextEvent geminiOut(geminiContext.get(), fcitx::EventType::InputContextFocusOut);
+    engine.deactivate(entry, geminiOut);
+    geminiContext->focusIn();
+    fcitx::InputContextEvent geminiIn(geminiContext.get(), fcitx::EventType::InputContextFocusIn);
+    engine.activate(entry, geminiIn);
+    const std::vector<std::string> exExpected{"ẽ"};
+    if (geminiContext->commits() != exExpected) {
+        std::string actual = "commits=";
+        for (const auto& commit : geminiContext->commits())
+            actual += "['" + commit + "']";
+        reportFailure("ex after focus bounce", "commits=['ẽ']", actual, "a lost signal backspace must still commit ẽ once focus returns");
+        return 1;
+    }
+    if (!send(engine, entry, *geminiContext, FcitxKey_m, false))
+        return 1;
     return 0;
 }
