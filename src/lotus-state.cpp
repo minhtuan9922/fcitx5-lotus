@@ -493,6 +493,32 @@ namespace fcitx {
         LOTUS_INFO("Folded fast keys into replacement: " + lotus::utf8::encode(finalPreedit));
     }
 
+    bool LotusState::missingOnlySignalBackspace() const {
+        // expectedBackspaces_ counts real deletes only. Pause is the anchor that
+        // finishes the replacement, so it is lost exactly when every real delete
+        // has already been echoed.
+        return currentMode() != LotusMode::Minecraft && g_isDeleting.load(std::memory_order_acquire) && expectedBackspaces_ > 0 &&
+               currentBackspaceCount_ >= expectedBackspaces_;
+    }
+
+    void LotusState::commitInterruptedReplacement() {
+        foldBufferedKeysIntoPendingCommit();
+        LOTUS_INFO("Commit replacement after a lost signal backspace: " + lotus::utf8::encode(pendingCommitString_));
+        appendCommit(pendingCommitString_);
+        pendingCommitString_.clear();
+        deferCommits_          = getFrontendName(&ic_) == "dbus";
+        expectedBackspaces_    = 0;
+        currentBackspaceCount_ = 0;
+        replacementDeadlineMs_ = 0;
+        g_isDeleting.store(false, std::memory_order_release);
+        if (deferCommits_) {
+            flushCommitBatch();
+        } else {
+            replayBufferedKeys();
+            flushCommitBatch();
+        }
+    }
+
     void LotusState::finishReplacement(KeyEvent& event) {
         foldBufferedKeysIntoPendingCommit();
         appendCommit(pendingCommitString_);

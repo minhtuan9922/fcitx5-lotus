@@ -294,6 +294,19 @@ namespace fcitx {
         void finishReplacement(KeyEvent& event);
 
         /**
+         * @brief True when every backspace that must reach the app has already been forwarded.
+         *
+         * The last echoed key is swallowed by fcitx. A focus bounce can drop that key, leaving
+         * the replacement waiting forever.
+         */
+        bool missingOnlySignalBackspace() const;
+
+        /**
+         * @brief Commits a replacement whose swallowed signal key was lost.
+         */
+        void commitInterruptedReplacement();
+
+        /**
          * @brief Folds keys buffered during a replacement into the pending commit.
          *
          * A second backspace round for those keys races the commit that just landed

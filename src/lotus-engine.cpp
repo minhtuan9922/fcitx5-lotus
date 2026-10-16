@@ -414,9 +414,15 @@ namespace fcitx {
         const bool uinputMode         = isUinputMode(targetMode);
         const bool focusBounce        = uinputMode && state->lastDeactivateTime_ > 0 && nowMs() - state->lastDeactivateTime_ < 100;
         const bool resumeReplacement  = focusBounce && state->deletionInterruptedAt_ > 0 && g_isDeleting.load(std::memory_order_acquire);
+        const bool signalLost         = state->missingOnlySignalBackspace();
         state->deletionInterruptedAt_ = 0;
 
-        if (!resumeReplacement) {
+        // The real backspaces have already reached the app. The remaining echo is
+        // the anchor Pause, and a focus bounce drops it. Commit now, or the field
+        // stays empty and every later key is swallowed while g_isDeleting stays true.
+        if (signalLost) {
+            state->commitInterruptedReplacement();
+        } else if (!resumeReplacement) {
             g_isDeleting.store(false, std::memory_order_release);
         }
 
@@ -434,7 +440,7 @@ namespace fcitx {
         } else if (surrvalid && !state->oldPreBuffer_.empty() && (nowMs() - state->lastDeactivateTime_) >= 100) {
             state->clearAllBuffers();
         }
-        if (!resumeReplacement) {
+        if (!resumeReplacement && !signalLost) {
             g_isDeleting.store(false, std::memory_order_release);
         }
         if (targetMode == LotusMode::Emoji) {
