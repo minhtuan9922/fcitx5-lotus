@@ -412,6 +412,24 @@ namespace fcitx {
          * @brief Connects and sets up IO watcher on Fcitx EventLoop for mouse click events.
          */
         void setupMouseWatcher();
+
+        /**
+         * @brief Remembers keyboard-us / lotus per focused Wayland window.
+         *
+         * GNOME gives every client the program name gnome-shell, so fcitx's
+         * Share Input State = Program cannot tell the apps apart.
+         */
+        void rememberPerAppInputMethod();
+        void loadImMemory();
+        void saveImMemory() const;
+
+        std::unique_ptr<EventSourceTime>                     imMemoryTimer_;
+        std::unique_ptr<EventSource>                         imRestoreDefer_;
+        std::unordered_map<std::string, std::string>         perAppInputMethod_;
+        std::string                                          imMemoryPath_;
+        std::string                                          lastWaylandApp_;
+        bool                                                 restoreImBlocked_ = false;
+        bool                                                 inRemember_       = false;
     };
 
 } // namespace fcitx

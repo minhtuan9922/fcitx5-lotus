@@ -39,6 +39,8 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <string_view>
+#include <systemd/sd-bus.h>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -218,6 +220,21 @@ namespace fcitx {
             charsetAction_.get(),          spellCheckAction_.get(),       macroAction_.get(),    capitalizeMacroAction_.get(),
             autoNonVnRestoreAction_.get(), enableDictionaryAction_.get(), settingsAction_.get(),
         };
+
+        const char* socketNs = std::getenv("LOTUS_SOCKET_NAMESPACE");
+        if (isGnome_ && (socketNs == nullptr || socketNs[0] == '\0')) {
+            imMemoryPath_ = configDir + "/lotus-im-memory.conf";
+            loadImMemory();
+            // sd_event time sources are oneshot. setEnabled(true) keeps the poll alive.
+            constexpr uint64_t kPollUsec = 200000;
+            imMemoryTimer_                = instance_.eventLoop().addTimeEvent(CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + kPollUsec, 1000, [this](EventSourceTime* event, uint64_t) {
+                rememberPerAppInputMethod();
+                event->setTime(now(CLOCK_MONOTONIC) + 200000);
+                event->setEnabled(true);
+                return true;
+            });
+            imMemoryTimer_->setEnabled(true);
+        }
     }
 
     void LotusEngine::initToggleAction(std::unique_ptr<SimpleAction>& action, Option<bool>& option, const std::string& actionId, const std::string& iconName,
@@ -245,6 +262,8 @@ namespace fcitx {
     }
 
     LotusEngine::~LotusEngine() {
+        imMemoryTimer_.reset();
+        imRestoreDefer_.reset();
         g_stopFlagMonitor.store(true, std::memory_order_release);
         mouseEventSource_.reset();
         FdGuard fd(g_mouseSocketFd.exchange(-1, std::memory_order_acq_rel));
@@ -454,6 +473,7 @@ namespace fcitx {
         for (const auto& action : toggleActions_) {
             statusArea.addAction(StatusGroup::InputMethod, action);
         }
+        rememberPerAppInputMethod();
     }
 
     bool LotusEngine::handleAppModeMenu(KeyEvent& keyEvent) {
@@ -1148,6 +1168,151 @@ namespace fcitx {
         }
     }
 
+    namespace {
+
+    // window-calls lists one object per window. wm_class sits in the same
+    // object as "focus":true.
+    std::string wmClassOfFocusedWindow(std::string_view json) {
+        constexpr std::string_view kFocus = "\"focus\":true";
+        constexpr std::string_view kClass = "\"wm_class\":\"";
+        for (size_t pos = 0; (pos = json.find(kFocus, pos)) != std::string_view::npos; pos += kFocus.size()) {
+            const size_t obj = json.rfind('{', pos);
+            if (obj == std::string_view::npos)
+                continue;
+            const size_t key = json.find(kClass, obj);
+            if (key == std::string_view::npos || key > pos)
+                continue;
+            const size_t begin = key + kClass.size();
+            const size_t end   = json.find('"', begin);
+            if (end == std::string_view::npos)
+                continue;
+            return std::string(json.substr(begin, end - begin));
+        }
+        return {};
+    }
+
+    // GNOME Wayland names every ibus client "gnome-shell". The window-calls
+    // extension reports the focused window's wm_class. Headless tests set
+    // LOTUS_SOCKET_NAMESPACE and must keep the name the fixture passed in.
+    std::string focusedWaylandApp(bool force = false) {
+        if (const char* ns = std::getenv("LOTUS_SOCKET_NAMESPACE"); ns != nullptr && ns[0] != '\0')
+            return {};
+
+        static std::string cached;
+        static int64_t     cachedAt = -100000;
+        const int64_t      now      = nowMs();
+        if (!force && now - cachedAt < 300)
+            return cached;
+        cachedAt = now;
+        cached.clear();
+
+        sd_bus* bus = nullptr;
+        if (sd_bus_open_user(&bus) < 0)
+            return {};
+
+        sd_bus_error    error   = SD_BUS_ERROR_NULL;
+        sd_bus_message* reply   = nullptr;
+        sd_bus_message* request = nullptr;
+        int             call    = sd_bus_message_new_method_call(bus, &request, "org.gnome.Shell", "/org/gnome/Shell/Extensions/Windows",
+                                                                 "org.gnome.Shell.Extensions.Windows", "List");
+        if (call >= 0)
+            call = sd_bus_call(bus, request, 200 * 1000, &error, &reply);
+        sd_bus_message_unref(request);
+        if (call >= 0) {
+            const char* json = nullptr;
+            if (sd_bus_message_read(reply, "s", &json) >= 0 && json != nullptr)
+                cached = wmClassOfFocusedWindow(json);
+        }
+        sd_bus_message_unref(reply);
+        sd_bus_error_free(&error);
+        sd_bus_unref(bus);
+        return cached;
+    }
+
+    } // namespace
+
+    void LotusEngine::loadImMemory() {
+        std::ifstream in(imMemoryPath_);
+        if (!in)
+            return;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#')
+                continue;
+            const auto eq = line.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 >= line.size())
+                continue;
+            perAppInputMethod_[line.substr(0, eq)] = line.substr(eq + 1);
+        }
+    }
+
+    void LotusEngine::saveImMemory() const {
+        if (imMemoryPath_.empty())
+            return;
+        std::ofstream out(imMemoryPath_, std::ios::trunc);
+        if (!out)
+            return;
+        out << "# Focused window wm_class = fcitx input method. keyboard-us is English, lotus is Vietnamese.\n";
+        std::vector<std::pair<std::string, std::string>> rows(perAppInputMethod_.begin(), perAppInputMethod_.end());
+        std::ranges::sort(rows);
+        for (const auto& [app, im] : rows)
+            out << app << '=' << im << '\n';
+    }
+
+    void LotusEngine::rememberPerAppInputMethod() {
+        if (inRemember_)
+            return;
+        auto* ic = instance_.inputContextManager().mostRecentInputContext();
+        if (ic == nullptr || ic->capabilityFlags().test(CapabilityFlag::Password) || ic->capabilityFlags().test(CapabilityFlag::Disable))
+            return;
+
+        const std::string app     = focusedWaylandApp(true);
+        const std::string current = instance_.currentInputMethod();
+        if (app.empty() || current.empty())
+            return;
+
+        if (app == lastWaylandApp_) {
+            if (restoreImBlocked_)
+                return;
+            const auto it = perAppInputMethod_.find(app);
+            if (it != perAppInputMethod_.end() && it->second == current)
+                return;
+            perAppInputMethod_[app] = current;
+            saveImMemory();
+            LOTUS_INFO("Remember input method for " + app + ": " + current);
+            return;
+        }
+
+        lastWaylandApp_   = app;
+        restoreImBlocked_ = false;
+        const auto it     = perAppInputMethod_.find(app);
+        if (it == perAppInputMethod_.end()) {
+            perAppInputMethod_[app] = current;
+            saveImMemory();
+            LOTUS_INFO("Remember input method for " + app + ": " + current);
+            return;
+        }
+        if (it->second == current) {
+            LOTUS_INFO("Input method for " + app + " stays " + current);
+            return;
+        }
+
+        const std::string saved = it->second;
+        LOTUS_INFO("Restore input method for " + app + ": " + saved);
+        // Switch after this focus event returns. Doing it here re-enters activate.
+        imRestoreDefer_ = instance_.eventLoop().addDeferEvent([this, saved](EventSource*) {
+            auto* recent = instance_.inputContextManager().mostRecentInputContext();
+            if (recent == nullptr || inRemember_)
+                return false;
+            inRemember_ = true;
+            instance_.setCurrentInputMethod(recent, saved, true);
+            inRemember_ = false;
+            if (instance_.currentInputMethod() != saved)
+                restoreImBlocked_ = true;
+            return false;
+        });
+    }
+
     std::string LotusEngine::getProgramName(InputContext* ic) {
         if (ic == nullptr) {
             return "unknown-app";
@@ -1159,6 +1324,12 @@ namespace fcitx {
             std::ostringstream oss;
             oss << "ctx_" << static_cast<const void*>(ic);
             programName = oss.str();
+        }
+        if (programName == "gnome-shell") {
+            if (const std::string focused = focusedWaylandApp(); !focused.empty()) {
+                LOTUS_INFO("Wayland focus app: " + focused);
+                return focused;
+            }
         }
         return programName;
     }
