@@ -37,6 +37,7 @@ find_package(Gettext REQUIRED)
 pkg_check_modules(LIBEVDEV REQUIRED IMPORTED_TARGET libevdev)
 pkg_check_modules(LIBINPUT REQUIRED IMPORTED_TARGET libinput)
 pkg_check_modules(LIBNOTIFY REQUIRED IMPORTED_TARGET libnotify)
+pkg_check_modules(LIBSYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 
 include("${FCITX_INSTALL_CMAKECONFIG_DIR}/Fcitx5Utils/Fcitx5CompilerSettings.cmake")
 

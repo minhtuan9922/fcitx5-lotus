@@ -14,6 +14,7 @@ target_link_libraries(lotus_test_core PUBLIC
     Lotus::Engine
     PkgConfig::LIBNOTIFY
     Pthread::Pthread
+    PkgConfig::LIBSYSTEMD
 )
 
 # The headless tests compile without PIC while lotus_core_objects builds with

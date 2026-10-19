@@ -19,6 +19,7 @@ target_link_libraries(lotus_core_objects PRIVATE
     Lotus::Engine
     PkgConfig::LIBNOTIFY
     Pthread::Pthread
+    PkgConfig::LIBSYSTEMD
 )
 
 # Parse the shared fcitx5 headers once instead of once per TU.
@@ -60,6 +61,7 @@ target_link_libraries(lotus
         Lotus::Engine
         PkgConfig::LIBNOTIFY
         Pthread::Pthread
+        PkgConfig::LIBSYSTEMD
 )
 
 target_include_directories(lotus PRIVATE
