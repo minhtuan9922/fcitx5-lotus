@@ -36,7 +36,11 @@
 
 namespace fcitx {
     constexpr int     kMaxScanLength         = 15;
-    constexpr int64_t kReplacementAckSlackMs = 200;
+    // Pause often never comes back through GNOME. This is how long to wait after the
+    // server has finished injecting before committing anyway. On this machine the
+    // app applies the Backspace in about 18ms; a focus-out commits at that moment.
+    // The slack only covers the case where focus stays and the echo never arrives.
+    constexpr int64_t kReplacementAckSlackMs = 12;
 
     constexpr int     kMinDelayMs = 1;
     constexpr int     kMaxDelayMs = 1000;
@@ -518,8 +522,7 @@ namespace fcitx {
     }
 
     void LotusState::foldBufferedKeysIntoPendingCommit() {
-        // Minecraft swallows a real backspace, so the prefix left on screen is not the one this fold assumes.
-        if (bufferedKeys_.empty() || g_realMode == LotusMode::Minecraft || !lotusEngine_ || *engine_.config().outputCharset != Charset::Unicode)
+        if (bufferedKeys_.empty() || !lotusEngine_ || *engine_.config().outputCharset != Charset::Unicode)
             return;
         if (pendingCommitString_.size() > oldPreBuffer_.size())
             return;
@@ -570,19 +573,24 @@ namespace fcitx {
         // expectedBackspaces_ counts real deletes only. Pause is the anchor that
         // finishes the replacement, so it is lost exactly when every real delete
         // has already been echoed.
-        return currentMode() != LotusMode::Minecraft && g_isDeleting.load(std::memory_order_acquire) && expectedBackspaces_ > 0 &&
-               currentBackspaceCount_ >= expectedBackspaces_;
+        return g_isDeleting.load(std::memory_order_acquire) && expectedBackspaces_ > 0 && currentBackspaceCount_ >= expectedBackspaces_;
     }
 
     void LotusState::commitInterruptedReplacement() {
+        if (!g_isDeleting.load(std::memory_order_acquire))
+            return;
         foldBufferedKeysIntoPendingCommit();
         LOTUS_INFO("Commit replacement after a lost signal backspace: " + lotus::utf8::encode(pendingCommitString_));
         appendCommit(pendingCommitString_);
         pendingCommitString_.clear();
-        deferCommits_          = getFrontendName(&ic_) == "dbus";
-        expectedBackspaces_    = 0;
-        currentBackspaceCount_ = 0;
-        replacementDeadlineMs_ = 0;
+        deferCommits_           = getFrontendName(&ic_) == "dbus";
+        expectedBackspaces_      = 0;
+        currentBackspaceCount_   = 0;
+        replacementDeadlineMs_   = 0;
+        deletionInterruptedAt_   = 0;
+        realSelect_              = false;
+        injectedBackspaceLanded_ = false;
+        ackWaitExtended_         = false;
         g_isDeleting.store(false, std::memory_order_release);
         if (deferCommits_) {
             flushCommitBatch();
@@ -677,11 +685,14 @@ namespace fcitx {
         realSelect_           = (currentMode() == LotusMode::Select && !isAutofillCertain_) || (isUinputMode(currentMode()) && addressBar);
         lastSelect_           = realSelect_;
         g_isDeleting.store(true, std::memory_order_release);
+        injectedBackspaceLanded_ = false;
+        ackWaitExtended_         = false;
         const auto    postDelay = static_cast<uint32_t>(clampDelay(appRuleSetting_.postDelay > 0 ? appRuleSetting_.postDelay : *engine_.config().defaultPostDelay));
 
         const int64_t injectMs = static_cast<int64_t>(expectedBackspaces_) * static_cast<int64_t>(interval);
         replacementDeadlineMs_ = nowMs() + static_cast<int64_t>(preDelay) + injectMs + static_cast<int64_t>(postDelay) + kReplacementAckSlackMs;
         replacementEchoGrace_  = static_cast<int64_t>(interval) + static_cast<int64_t>(postDelay) + kReplacementAckSlackMs;
+        armReplacementDeadline();
         // Select mode: the uinput server selects with Shift+Left instead. The
         // trigger-key compensation above still applies because the last echoed
         // Left is swallowed; autofill compensation does not, see above.
@@ -1203,35 +1214,55 @@ namespace fcitx {
         }
     }
 
+    void LotusState::armReplacementDeadline() {
+        const int64_t  delayMs = std::max<int64_t>(replacementDeadlineMs_ - nowMs(), 0);
+        const uint64_t when    = now(CLOCK_MONOTONIC) + static_cast<uint64_t>(delayMs) * 1000ULL;
+        if (!replacementAckTimer_) {
+            // sd-event time sources are oneshot. setEnabled keeps the same source reusable.
+            replacementAckTimer_ = engine_.instance()->eventLoop().addTimeEvent(CLOCK_MONOTONIC, when, 1000, [this](EventSourceTime* event, uint64_t) {
+                finishOverdueReplacement();
+                if (replacementDeadlineMs_ == 0 || !g_isDeleting.load(std::memory_order_acquire))
+                    return false;
+                const int64_t nextMs = std::max<int64_t>(replacementDeadlineMs_ - nowMs(), 0);
+                event->setTime(now(CLOCK_MONOTONIC) + static_cast<uint64_t>(nextMs) * 1000ULL);
+                event->setEnabled(true);
+                return true;
+            });
+        }
+        replacementAckTimer_->setTime(when);
+        replacementAckTimer_->setEnabled(true);
+    }
+
     void LotusState::finishOverdueReplacement() {
-        if (replacementDeadlineMs_ == 0 || nowMs() < replacementDeadlineMs_) {
+        if (replacementDeadlineMs_ == 0 || nowMs() + 5 < replacementDeadlineMs_)
+            return;
+        if (!g_isDeleting.load(std::memory_order_acquire)) {
+            replacementDeadlineMs_ = 0;
             return;
         }
-        replacementDeadlineMs_ = 0;
-        if (!g_isDeleting.load(std::memory_order_acquire)) {
+        // commitString on an unfocused ibus context is discarded, and the injected
+        // Backspace has already removed the raw letter. Wait until focus returns.
+        if (!ic_.hasFocus()) {
+            replacementDeadlineMs_ = nowMs() + 40;
+            armReplacementDeadline();
+            return;
+        }
+        // The Backspace and the commit travel on different channels. Committing
+        // before the app has applied the delete lets that Backspace erase the new
+        // character. Extend the wait once, then commit anyway.
+        if (!injectedBackspaceLanded_ && !ackWaitExtended_) {
+            ackWaitExtended_      = true;
+            replacementDeadlineMs_ = nowMs() + 40;
+            armReplacementDeadline();
             return;
         }
 
         cancelPendingUinput();
-        LOTUS_WARN("Replacement ack timed out, finishing without the remaining backspace echoes");
-        appendCommit(pendingCommitString_);
-        pendingCommitString_.clear();
-        expectedBackspaces_    = 0;
-        currentBackspaceCount_ = 0;
-        deletionInterruptedAt_ = 0;
-        realSelect_            = false;
-        g_isDeleting.store(false, std::memory_order_release);
-
-        (*lotusEngine_).reset();
-        oldPreBuffer_.clear();
-        hasHistory_   = false;
-        deferCommits_ = getFrontendName(&ic_) == "dbus";
-        if (deferCommits_) {
-            flushCommitBatch();
-        } else {
-            replayBufferedKeys();
-            flushCommitBatch();
-        }
+        // The server has already injected the deletes. Waiting for their echo, or for
+        // Pause, drops the letters typed in the meantime. Fold those letters and commit.
+        LOTUS_WARN("Replacement ack timed out, committing without the anchor key");
+        replacementDeadlineMs_ = 0;
+        commitInterruptedReplacement();
     }
 
     void LotusState::applyAutoCapitalize(KeyEvent& keyEvent, KeySym& currentSym) {
@@ -1290,7 +1321,10 @@ namespace fcitx {
                     return true;
                 }
             } else if (currentSym == FcitxKey_Pause) {
-                handleUInputKeyPress(keyEvent, currentSym);
+                if (g_isDeleting.load(std::memory_order_acquire)) {
+                    currentBackspaceCount_ = expectedBackspaces_ + 1;
+                    finishReplacement(keyEvent);
+                }
                 return true;
             } else if (realSelect_ && (currentSym == FcitxKey_Left || currentSym == FcitxKey_Delete)) {
                 if (currentSym == FcitxKey_Left) {

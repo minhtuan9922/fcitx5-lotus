@@ -451,14 +451,16 @@ namespace fcitx {
         state->deletionInterruptedAt_ = 0;
 
         // The real backspaces have already reached the app. The remaining echo is
-        // the anchor Pause, and a focus bounce drops it. Commit now, or the field
-        // stays empty and every later key is swallowed while g_isDeleting stays true.
+        // the anchor Pause, and a focus bounce drops it. Commit now that this
+        // context has focus again. A commit during the unfocused gap is discarded,
+        // the Backspace has already deleted the raw letter, and the field stays empty.
         // Cancel drops a burst still queued on the server when this focus-in is not
         // continuing that replacement.
-        if (signalLost || !resumeReplacement) {
+        const bool finishNow = signalLost || (resumeReplacement && state->injectedBackspaceLanded_);
+        if (finishNow || !resumeReplacement) {
             LotusState::cancelPendingUinput();
         }
-        if (signalLost) {
+        if (finishNow) {
             state->commitInterruptedReplacement();
         } else if (!resumeReplacement) {
             g_isDeleting.store(false, std::memory_order_release);
@@ -755,6 +757,9 @@ namespace fcitx {
     void LotusEngine::reset(const InputMethodEntry& /*entry*/, InputContextEvent& event) {
         if (g_isDeleting.load(std::memory_order_acquire)) {
             LOTUS_INFO("Ignore reset while is_deleting");
+            auto* state = event.inputContext()->propertyFor(&factory_);
+            if (state != nullptr)
+                state->injectedBackspaceLanded_ = true;
             return;
         }
         LOTUS_INFO("Reset engine");
@@ -781,6 +786,8 @@ namespace fcitx {
                 state->abortPendingUinputReplacement();
             }
             LOTUS_INFO("Replacement interrupted by focus out");
+            // Chrome drops commitString while this context is unfocused. Leave the
+            // replacement armed; activate() commits once focus is back.
             return;
         }
 

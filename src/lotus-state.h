@@ -146,10 +146,13 @@ namespace fcitx {
         bool                                  trackingModifierTap_   = false; ///< Selected modifier held, waiting for consecutive keyup
         bool                                  shiftHeld_             = false; ///< Live Shift press state tracked from key events
         bool                                  macroSkip_             = false; ///< Macro disabled for the current word
-        bool                                  isLibreoffice_         = false;
-        bool                                  isChromium_            = false;
-        int64_t                               replacementDeadlineMs_ = 0; ///< ms by which every injected backspace must be echoed (0 = no replacement in flight)
-        int64_t                               replacementEchoGrace_  = 0; ///< deadline grace re-armed on each echo
+        bool                                  isLibreoffice_           = false;
+        bool                                  isChromium_              = false;
+        int64_t                               replacementDeadlineMs_   = 0;     ///< ms by which every injected backspace must be echoed (0 = no replacement in flight)
+        int64_t                               replacementEchoGrace_    = 0;     ///< deadline grace re-armed on each echo
+        std::unique_ptr<EventSourceTime>      replacementAckTimer_;             ///< Fires when the replacement ack does not return
+        bool                                  injectedBackspaceLanded_ = false; ///< The app reset on an in-flight injected Backspace
+        bool                                  ackWaitExtended_         = false; ///< One extra wait when the Backspace has not landed yet
         std::chrono::steady_clock::time_point lastCommitTime_;
 
         // Replacement aborted at focus-out, committed once focus returns.
@@ -324,6 +327,11 @@ namespace fcitx {
          * @param event The key event of the final echoed key.
          */
         void finishReplacement(KeyEvent& event);
+
+        /**
+         * @brief Arms the ack timer for the deadline stored in replacementDeadlineMs_.
+         */
+        void armReplacementDeadline();
 
         /**
          * @brief True when every backspace that must reach the app has already been forwarded.
