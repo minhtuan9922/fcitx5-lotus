@@ -96,12 +96,16 @@ namespace fcitx {
     void LotusState::setOption() {
         if (!lotusEngine_)
             return;
+        // Spell check with an empty dictionary rejects every word, including valid ones such as
+        // "tiếng". Keep those syllables when the list failed to load.
+        const std::shared_ptr<const lotus::Dictionary>& dictionary = engine_.dictionary();
+        const bool dictionaryReady = static_cast<bool>(dictionary) && !dictionary->words().empty();
         lotus::Options option = {
             .autoNonVnRestore    = *engine_.config().autoNonVnRestore,
             .ddFreeStyle         = *engine_.config().ddFreeStyle,
             .macroEnabled        = *engine_.config().enableMacro,
             .autoCapitalizeMacro = *engine_.config().capitalizeMacro,
-            .spellCheckWithDicts = *engine_.config().spellCheck,
+            .spellCheckWithDicts = *engine_.config().spellCheck && dictionaryReady,
             .modernStyle         = *engine_.config().modernStyle,
             .freeMarking         = *engine_.config().freeMarking,
             .outputCharset       = *engine_.config().outputCharset,

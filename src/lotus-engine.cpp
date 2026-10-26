@@ -325,6 +325,8 @@ namespace fcitx {
 #endif
             if (fd.isValid()) {
                 loadFromFd(fd.release());
+            } else {
+                LOTUS_WARN("Cannot open Vietnamese dictionary lotus/vietnamese.cm.dict");
             }
         } else {
 #if LOTUS_USE_MODERN_FCITX_API
@@ -350,6 +352,13 @@ namespace fcitx {
             }
         }
         dictionary_ = std::move(dictionary);
+        // An empty list makes every word break restore the raw keys, so "tiếng" becomes "tieengs"
+        // even though the syllable is valid. Say so here; the input context then keeps valid syllables.
+        if (dictionary_->words().empty()) {
+            LOTUS_WARN("Vietnamese dictionary has no words");
+        } else {
+            LOTUS_INFO("Vietnamese dictionary: " + std::to_string(dictionary_->words().size()) + " words");
+        }
     }
 
     const Configuration* LotusEngine::getSubConfig(const std::string& path) const {
