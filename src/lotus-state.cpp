@@ -41,6 +41,10 @@ namespace fcitx {
     // app applies the Backspace in about 18ms; a focus-out commits at that moment.
     // The slack only covers the case where focus stays and the echo never arrives.
     constexpr int64_t kReplacementAckSlackMs = 12;
+    // Wordcraft lays the paragraph out on each Backspace. A burst sent 5ms apart
+    // is still queued when other clients have already applied it, and the last
+    // Backspace lands after the commit and deletes the new letter ("Tiêến").
+    constexpr int64_t kSlowAppPerBackspaceMs = 70;
 
     constexpr int     kMinDelayMs = 1;
     constexpr int     kMaxDelayMs = 1000;
@@ -635,8 +639,14 @@ namespace fcitx {
         }
         currentBackspaceCount_ += 1;
         if (currentBackspaceCount_ <= expectedBackspaces_ && currentSym != FcitxKey_Pause) {
-            // Re-arm the deadline so a slow burst is never abandoned.
-            replacementDeadlineMs_ = nowMs() + replacementEchoGrace_;
+            // A slow burst must not be abandoned, but an early echo must not pull
+            // the deadline forward. Wordcraft echoes the first Backspace while the
+            // rest are still queued; committing on that grace deletes the new letter.
+            const int64_t nextDeadline = nowMs() + replacementEchoGrace_;
+            if (nextDeadline > replacementDeadlineMs_) {
+                replacementDeadlineMs_ = nextDeadline;
+                armReplacementDeadline();
+            }
             return false; // Allow intermediate backspaces/lefts to reach the app to clear autofill/old text / extend the selection.
         }
         // The anchor closes the burst even if echoes are lost.
@@ -691,6 +701,8 @@ namespace fcitx {
         g_isDeleting.store(true, std::memory_order_release);
         injectedBackspaceLanded_ = false;
         ackWaitExtended_         = false;
+        replacementBurst_        = expectedBackspaces_;
+        replacementSentAtMs_     = nowMs() + static_cast<int64_t>(preDelay);
         const auto    postDelay = static_cast<uint32_t>(clampDelay(appRuleSetting_.postDelay > 0 ? appRuleSetting_.postDelay : *engine_.config().defaultPostDelay));
 
         const int64_t injectMs = static_cast<int64_t>(expectedBackspaces_) * static_cast<int64_t>(interval);
@@ -1251,6 +1263,20 @@ namespace fcitx {
             armReplacementDeadline();
             return;
         }
+        // Wordcraft applies one Backspace per layout. Hold the commit until that
+        // queue has drained. Pause still finishes the burst immediately.
+        if (slowBackspaceApp_ && replacementBurst_ > 1) {
+            const int64_t readyAt = replacementSentAtMs_ + static_cast<int64_t>(replacementBurst_) * kSlowAppPerBackspaceMs;
+            if (nowMs() + 5 < readyAt) {
+                replacementDeadlineMs_ = readyAt;
+                armReplacementDeadline();
+                return;
+            }
+            LOTUS_WARN("Replacement ack timed out, committing without the anchor key");
+            replacementDeadlineMs_ = 0;
+            commitInterruptedReplacement();
+            return;
+        }
         // The Backspace and the commit travel on different channels. Committing
         // before the app has applied the delete lets that Backspace erase the new
         // character. Extend the wait once, then commit anyway.
@@ -1261,9 +1287,8 @@ namespace fcitx {
             return;
         }
 
-        cancelPendingUinput();
-        // The server has already injected the deletes. Waiting for their echo, or for
-        // Pause, drops the letters typed in the meantime. Fold those letters and commit.
+        // Leave the burst queued. Cancel drops a Backspace the server has not sent
+        // yet, and one sent after this commit deletes the replacement.
         LOTUS_WARN("Replacement ack timed out, committing without the anchor key");
         replacementDeadlineMs_ = 0;
         commitInterruptedReplacement();

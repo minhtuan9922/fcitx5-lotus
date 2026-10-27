@@ -281,6 +281,10 @@ int main(int argc, char* argv[]) {
 
     uint32_t              currentPostDelay = 0; ///< stores postDelay from KbMsg
     uint32_t              currentInterval  = 5; ///< ms between injected keys within one request
+    // Next paced key. A libinput wakeup must not skip the burst: poll only drains
+    // pending keys on timeout, so a busy pointer fd holds Backspace until the addon
+    // has already committed the replacement.
+    auto                  nextInjectAt     = std::chrono::steady_clock::now();
 
     struct sigaction      sa{};
     sa.sa_handler = signalHandler;
@@ -293,9 +297,15 @@ int main(int argc, char* argv[]) {
 
     while (g_running.load(std::memory_order_acquire)) {
 
-        int pollTimeout = -1;
-        if (pendingBackspaces > 0 || pendingSelects > 0 || pendingAnchor || pendingSelectAnchor) {
-            pollTimeout = static_cast<int>(currentInterval);
+        const bool burstPending = pendingBackspaces > 0 || pendingSelects > 0 || pendingAnchor || pendingSelectAnchor;
+        int        pollTimeout  = -1;
+        if (burstPending) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= nextInjectAt) {
+                pollTimeout = 0;
+            } else {
+                pollTimeout = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(nextInjectAt - now).count());
+            }
         }
 
         int ret = poll(fds.data(), fds.size(), pollTimeout);
@@ -307,7 +317,9 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        if (ret == 0) {
+        // Pace on the clock, not on poll returning 0. A readable libinput fd wakes
+        // every iteration and would otherwise hold the rest of the burst.
+        if (burstPending && std::chrono::steady_clock::now() >= nextInjectAt) {
             if (pendingBackspaces > 0) {
                 uinput.sendTap(KEY_BACKSPACE);
                 --pendingBackspaces;
@@ -334,6 +346,7 @@ int main(int argc, char* argv[]) {
                     pendingSelectAnchor = false;
                 }
             }
+            nextInjectAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(currentInterval);
         }
 
         const int dispatchRc = libinput_dispatch(li_ctx.getLi());
@@ -428,6 +441,7 @@ int main(int argc, char* argv[]) {
                     pendingSelects += msg.count - 1;
                     pendingSelectAnchor = true;
                     pendingAnchor       = false;
+                    nextInjectAt        = std::chrono::steady_clock::now() + std::chrono::milliseconds(currentInterval);
 
                 } else if (msg.count > 0 && op == KbOp::Backspace) {
                     if (msg.preDelay > 0) {
@@ -443,6 +457,7 @@ int main(int argc, char* argv[]) {
                     pendingAnchor = true;
                     pendingBackspaces += msg.count - 1;
                     uinput.sendTap(KEY_BACKSPACE);
+                    nextInjectAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(currentInterval);
                 } else if (msg.count > 0) {
                     LotusLogger::instance().warn("Unknown keyboard message op: " + std::to_string(static_cast<int>(msg.op)));
                 }

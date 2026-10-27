@@ -148,7 +148,10 @@ namespace fcitx {
         bool                                  macroSkip_             = false; ///< Macro disabled for the current word
         bool                                  isLibreoffice_           = false;
         bool                                  isChromium_              = false;
+        bool                                  slowBackspaceApp_        = false; ///< Client applies a Backspace burst slower than the ack (Wordcraft)
         int64_t                               replacementDeadlineMs_   = 0;     ///< ms by which every injected backspace must be echoed (0 = no replacement in flight)
+        int64_t                               replacementSentAtMs_     = 0;     ///< when the current burst was handed to the server
+        size_t                                replacementBurst_        = 0;     ///< backspaces sent for this replacement; not cleared by an echo
         int64_t                               replacementEchoGrace_    = 0;     ///< deadline grace re-armed on each echo
         std::unique_ptr<EventSourceTime>      replacementAckTimer_;             ///< Fires when the replacement ack does not return
         bool                                  injectedBackspaceLanded_ = false; ///< The app reset on an in-flight injected Backspace

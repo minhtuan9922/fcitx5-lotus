@@ -448,9 +448,10 @@ namespace fcitx {
 
         updateCharsetAction(event.inputContext());
 
-        auto* state           = ic->propertyFor(&factory_);
-        state->isLibreoffice_ = (appName == "soffice");
-        state->isChromium_    = std::ranges::any_of(chromiumList, [&appName](std::string_view app) { return appName.find(app) != std::string::npos; });
+        auto* state              = ic->propertyFor(&factory_);
+        state->isLibreoffice_    = (appName == "soffice");
+        state->isChromium_       = std::ranges::any_of(chromiumList, [&appName](std::string_view app) { return appName.find(app) != std::string::npos; });
+        state->slowBackspaceApp_ = (appName == "wordcraft");
         state->finishOverdueReplacement();
 
         const bool uinputMode         = isUinputMode(targetMode);
